@@ -1,41 +1,14 @@
 const express = require('express');
 const cors = require('cors');
+const dns = require('dns').promises;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const SPAMHAUS_USER = process.env.SPAMHAUS_USER || 'ybdfqtuk@81302263';
-const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
+const DQS_KEY = process.env.SPAMHAUS_DQS_KEY;
 
-// 1. Authenticate & Obtain Bearer Token
-async function getAuthToken() {
-  const response = await fetch('https://api.spamhaus.org/api/v1/login', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'User-Agent': 'SpamhausProxyClient/1.0'
-    },
-    body: JSON.stringify({
-      username: SPAMHAUS_USER,
-      password: SPAMHAUS_PASS,
-      realm: 'intel'
-    })
-  });
-
-  const rawText = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`Login Failed [${response.status}]: ${rawText}`);
-  }
-
-  const data = JSON.parse(rawText);
-  return data.token || data.access_token;
-}
-
-// 2. Query Reputation Score Endpoint
 app.get('/check-domain', async (req, res) => {
   const { domain } = req.query;
 
@@ -43,29 +16,44 @@ app.get('/check-domain', async (req, res) => {
     return res.status(400).json({ error: 'Domain parameter is required' });
   }
 
-  try {
-    const token = await getAuthToken();
+  if (!DQS_KEY) {
+    return res.status(500).json({ error: 'SPAMHAUS_DQS_KEY is missing in Render Environment Variables.' });
+  }
 
-    // Query Spamhaus Intelligence API domain reputation endpoint
-    const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(domain)}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-        'User-Agent': 'SpamhausProxyClient/1.0'
-      }
+  try {
+    // Query Spamhaus DBL via native DNS
+    const queryHost = `${domain}.${DQS_KEY}.dbl.dq.spamhaus.net`;
+    const addresses = await dns.resolve4(queryHost);
+
+    // Map DNS return codes to category scores
+    const sub = { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
+    let totalScore = 0;
+
+    addresses.forEach(ip => {
+      if (ip === '127.0.1.2') { sub.smtp = 10; totalScore += 10; }
+      if (ip === '127.0.1.4') { sub.identity = 10; totalScore += 10; }
+      if (ip === '127.0.1.5') { sub.malware = 10; totalScore += 10; }
+      if (ip === '127.0.1.6') { sub.infra = 10; totalScore += 10; }
+      if (ip === '127.0.1.102') { sub.human = 5; totalScore += 5; }
     });
 
-    const rawResult = await apiRes.text();
-
-    try {
-      const parsedData = JSON.parse(rawResult);
-      return res.json(parsedData);
-    } catch {
-      return res.status(apiRes.status).send(rawResult);
-    }
+    return res.json({
+      domain: domain,
+      reputation_score: totalScore,
+      scores: sub
+    });
 
   } catch (error) {
-    return res.status(500).json({ error: 'Spamhaus API Request Failed', details: error.message });
+    // ENOTFOUND / ENODATA means the domain is clean (0 score)
+    if (error.code === 'ENOTFOUND' || error.code === 'ENODATA') {
+      return res.json({
+        domain: domain,
+        reputation_score: 0,
+        scores: { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 }
+      });
+    }
+
+    return res.status(500).json({ error: 'DNS Query Failed', details: error.message });
   }
 });
 
