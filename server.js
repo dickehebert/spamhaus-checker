@@ -1,16 +1,41 @@
 const express = require('express');
 const cors = require('cors');
-const dns = require('dns').promises;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const SPAMHAUS_USER = process.env.SPAMHAUS_USER || 'ybdfqtuk@81302263';
+const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
 
-// Set this variable in Render under Environment Variables as your DQS Key
-const DQS_KEY = process.env.SPAMHAUS_DQS_KEY;
+// 1. Authenticate & Obtain Bearer Token
+async function getAuthToken() {
+  const response = await fetch('https://api.spamhaus.org/api/v1/login', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'User-Agent': 'SpamhausProxyClient/1.0'
+    },
+    body: JSON.stringify({
+      username: SPAMHAUS_USER,
+      password: SPAMHAUS_PASS,
+      realm: 'intel'
+    })
+  });
 
+  const rawText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Login Failed [${response.status}]: ${rawText}`);
+  }
+
+  const data = JSON.parse(rawText);
+  return data.token || data.access_token;
+}
+
+// 2. Query Reputation Score Endpoint
 app.get('/check-domain', async (req, res) => {
   const { domain } = req.query;
 
@@ -18,42 +43,32 @@ app.get('/check-domain', async (req, res) => {
     return res.status(400).json({ error: 'Domain parameter is required' });
   }
 
-  if (!DQS_KEY) {
-    return res.status(500).json({ error: 'SPAMHAUS_DQS_KEY is not configured in Environment Variables.' });
-  }
-
   try {
-    // Spamhaus DQS Domain Blocklist (DBL) query format:
-    // [domain].[DQS_KEY].dbl.dq.spamhaus.net
-    const queryHost = `${domain}.${DQS_KEY}.dbl.dq.spamhaus.net`;
+    const token = await getAuthToken();
 
-    const addresses = await dns.resolve4(queryHost);
-
-    // If a DNS response is returned, the domain IS listed on Spamhaus DBL
-    return res.json({
-      domain: domain,
-      listed: true,
-      return_codes: addresses,
-      status: 'Listed on Spamhaus Domain Blocklist (DBL)'
+    // Query Spamhaus Intelligence API domain reputation endpoint
+    const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(domain)}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json',
+        'User-Agent': 'SpamhausProxyClient/1.0'
+      }
     });
 
-  } catch (error) {
-    // ENOTFOUND means DNS returned NXDOMAIN -> The domain is CLEAN
-    if (error.code === 'ENOTFOUND' || error.code === 'ENODATA') {
-      return res.json({
-        domain: domain,
-        listed: false,
-        status: 'Clean (Not listed on Spamhaus DBL)'
-      });
+    const rawResult = await apiRes.text();
+
+    try {
+      const parsedData = JSON.parse(rawResult);
+      return res.json(parsedData);
+    } catch {
+      return res.status(apiRes.status).send(rawResult);
     }
 
-    return res.status(500).json({
-      error: 'DNS Query Failed',
-      details: error.message
-    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Spamhaus API Request Failed', details: error.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
