@@ -1,13 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const dns = require('dns').promises;
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const DQS_KEY = process.env.SPAMHAUS_DQS_KEY;
 
 app.get('/check-domain', async (req, res) => {
   const { domain } = req.query;
@@ -16,43 +15,64 @@ app.get('/check-domain', async (req, res) => {
     return res.status(400).json({ error: 'Domain parameter is required' });
   }
 
+  let browser;
   try {
-    const sub = { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
-    let totalScore = 0;
-
-    // 1. Check Spamhaus DQS DNSBL
-    if (DQS_KEY) {
-      try {
-        const queryHost = `${domain}.${DQS_KEY}.dbl.dq.spamhaus.net`;
-        const addresses = await dns.resolve4(queryHost);
-
-        addresses.forEach(ip => {
-          if (ip === '127.0.1.2') { sub.smtp = 20; totalScore += 20; }
-          if (ip === '127.0.1.4') { sub.identity = 25; totalScore += 25; }
-          if (ip === '127.0.1.5') { sub.malware = 25; totalScore += 25; }
-          if (ip === '127.0.1.6') { sub.infra = 20; totalScore += 20; }
-          if (ip === '127.0.1.102') { sub.human = 10; totalScore += 10; }
-        });
-      } catch (err) {
-        // ENOTFOUND means clean on DBL
-      }
-    }
-
-    // 2. Add Baseline Infrastructure Risk Score for Telemetry Realism
-    // If DBL is clean, assign a baseline infra telemetry score (e.g., 11)
-    if (totalScore === 0) {
-      sub.infra = 11;
-      totalScore = 11;
-    }
-
-    return res.json({
-      domain: domain,
-      reputation_score: totalScore,
-      scores: sub
+    // Launch headless Chromium instance
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--single-process'
+      ]
     });
 
+    const page = await browser.newPage();
+
+    // Set real browser User-Agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    // Navigate to live Spamhaus web checker
+    const targetUrl = `https://www.spamhaus.org/domain-reputation?domain=${encodeURIComponent(domain)}`;
+    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Wait for the dynamic score card container to populate
+    await page.waitForSelector('.big-score, [class*="score"], h1, div', { timeout: 15000 });
+
+    // Extract exact dynamic scores directly from the page DOM
+    const resultData = await page.evaluate(() => {
+      const bodyText = document.body.innerText;
+      
+      // Match reputation score text
+      const scoreMatch = bodyText.match(/Reputation score\s*([\d\.]+)/i) || bodyText.match(/(\d+\.?\d*)\s*Reputation/i);
+      const mainScore = scoreMatch ? parseFloat(scoreMatch[1]) : 0;
+
+      // Extract category scores
+      const extractCategory = (name) => {
+        const reg = new RegExp(`${name}\\s*([\\d\\.]+)`, 'i');
+        const m = bodyText.match(reg);
+        return m ? parseFloat(m[1]) : 0;
+      };
+
+      return {
+        reputation_score: mainScore,
+        scores: {
+          human: extractCategory('human'),
+          identity: extractCategory('identity'),
+          infra: extractCategory('infra'),
+          malware: extractCategory('malware'),
+          smtp: extractCategory('smtp')
+        }
+      };
+    });
+
+    await browser.close();
+    return res.json({ domain, ...resultData });
+
   } catch (error) {
-    return res.status(500).json({ error: 'Lookup Failed', details: error.message });
+    if (browser) await browser.close();
+    return res.status(500).json({ error: 'Failed to scrape live score', details: error.message });
   }
 });
 
