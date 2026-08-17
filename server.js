@@ -7,99 +7,111 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const SPAMHAUS_USER = process.env.SPAMHAUS_USER || 'kerlgtxr@81302263';
-const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
+// 1. Manual Token Generation Endpoint
+app.post('/generate-token', async (req, res) => {
+  const { username, password, realm } = req.body;
 
-let cachedToken = null;
-let tokenExpiry = 0;
-
-// Fetch auth token from Spamhaus Intelligence API
-async function getAuthToken() {
-  const now = Date.now();
-  if (cachedToken && now < tokenExpiry) {
-    return cachedToken;
-  }
-
-  const response = await fetch('https://api.spamhaus.org/api/v1/login', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: JSON.stringify({
-      username: SPAMHAUS_USER,
-      password: SPAMHAUS_PASS,
-      realm: 'intel'
-    })
-  });
-
-  const rawText = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`Login Failed [${response.status}]: ${rawText}`);
-  }
-
-  const data = JSON.parse(rawText);
-  cachedToken = data.token;
-  tokenExpiry = data.expires ? (data.expires * 1000 - 60000) : (now + 12 * 3600 * 1000);
-  
-  return cachedToken;
-}
-
-app.get('/check-domain', async (req, res) => {
-  const { domain } = req.query;
-
-  if (!domain) {
-    return res.status(400).json({ error: 'Domain parameter is required' });
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and Password are required' });
   }
 
   try {
-    const token = await getAuthToken();
-
-    // Query SIA Endpoint
-    const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(domain)}`, {
+    const response = await fetch('https://api.spamhaus.org/api/v1/login', {
+      method: 'POST',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
         'Accept': 'application/json'
-      }
+      },
+      body: JSON.stringify({
+        username: username.trim(),
+        password: password.trim(),
+        realm: realm || 'intel'
+      })
     });
 
-    const rawResult = await apiRes.text();
-    let parsedData;
+    const rawText = await response.text();
 
-    try {
-      parsedData = JSON.parse(rawResult);
-    } catch {
-      // If Spamhaus returns non-JSON, wrap it safely
-      return res.status(apiRes.status).json({
-        error: `Spamhaus returned status ${apiRes.status}`,
-        details: rawResult
+    if (!response.ok) {
+      return res.status(response.status).json({ 
+        error: `Login Failed [HTTP ${response.status}]`, 
+        details: rawText 
       });
     }
 
-    if (!apiRes.ok) {
-      return res.status(apiRes.status).json({
-        error: parsedData.message || 'API query failed',
-        details: parsedData
-      });
-    }
-
-    // Extract numerical scores
-    const mainScore = parsedData.reputation_score ?? parsedData.score ?? 0;
-    const subScores = parsedData.scores || { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
-
+    const data = JSON.parse(rawText);
     return res.json({
-      domain: domain,
-      reputation_score: mainScore,
-      scores: subScores
+      success: true,
+      token: data.token,
+      expires: data.expires || null
     });
 
   } catch (error) {
-    return res.status(500).json({
-      error: 'SIA Proxy Failed',
-      details: error.message
-    });
+    return res.status(500).json({ error: 'Authentication Request Failed', details: error.message });
   }
+});
+
+// 2. Domain Score Lookup Endpoint using Bearer Token
+app.post('/check-domains', async (req, res) => {
+  const { token, domains } = req.body;
+
+  if (!token) {
+    return res.status(401).json({ error: 'Valid Bearer Token required' });
+  }
+
+  if (!domains || !Array.isArray(domains) || domains.length === 0) {
+    return res.status(400).json({ error: 'Domains array is required' });
+  }
+
+  const results = [];
+
+  for (const domain of domains) {
+    const cleanDomain = domain.trim();
+    if (!cleanDomain) continue;
+
+    try {
+      // Query official SIA endpoint
+      const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(cleanDomain)}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json'
+        }
+      });
+
+      const rawText = await apiRes.text();
+
+      if (apiRes.status === 404) {
+        // Domain clean or not tracked in SIA dataset
+        results.push({
+          domain: cleanDomain,
+          reputation_score: 0,
+          scores: { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 },
+          status: 'Clean / Unlisted'
+        });
+        continue;
+      }
+
+      if (!apiRes.ok) {
+        results.push({
+          domain: cleanDomain,
+          error: `HTTP ${apiRes.status}`,
+          details: rawText
+        });
+        continue;
+      }
+
+      const parsed = JSON.parse(rawText);
+      results.push({
+        domain: cleanDomain,
+        reputation_score: parsed.reputation_score ?? parsed.score ?? 0,
+        scores: parsed.scores || { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 }
+      });
+
+    } catch (err) {
+      results.push({ domain: cleanDomain, error: err.message });
+    }
+  }
+
+  return res.json({ success: true, results });
 });
 
 app.listen(PORT, () => {
