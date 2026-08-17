@@ -9,27 +9,29 @@ const PORT = process.env.PORT || 3000;
 const SPAMHAUS_USER = process.env.SPAMHAUS_USER;
 const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
 
+// Official Spamhaus Intelligence API login function
 async function getAuthToken() {
-  const credentials = Buffer.from(`${SPAMHAUS_USER}:${SPAMHAUS_PASS}`).toString('base64');
-  
-  const response = await fetch('https://api.spamhaus.org/v1/token', {
+  const response = await fetch('https://api.spamhaus.org/api/v1/login', {
     method: 'POST',
     headers: {
-      'Authorization': `Basic ${credentials}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Mozilla/5.0'
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
     },
-    body: 'grant_type=client_credentials'
+    body: JSON.stringify({
+      username: SPAMHAUS_USER,
+      password: SPAMHAUS_PASS,
+      realm: 'intel'
+    })
   });
 
   const rawText = await response.text();
 
   if (!response.ok) {
-    throw new Error(`Token request failed [${response.status}]: ${rawText}`);
+    throw new Error(`Token Login Failed [${response.status}]: ${rawText}`);
   }
 
   const data = JSON.parse(rawText);
-  return data.access_token;
+  return data.token; // Returns the SIA Bearer token
 }
 
 app.get('/check-domain', async (req, res) => {
@@ -42,11 +44,11 @@ app.get('/check-domain', async (req, res) => {
   try {
     const token = await getAuthToken();
     
-    const apiRes = await fetch(`https://check.spamhaus.org/api/checker/v1/domain/${encodeURIComponent(domain)}`, {
+    // Official Spamhaus Intelligence Domain Lookup Endpoint
+    const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(domain)}`, {
       headers: {
         'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0'
+        'Accept': 'application/json'
       }
     });
 
