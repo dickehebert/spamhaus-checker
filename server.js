@@ -1,22 +1,52 @@
 const express = require('express');
 const cors = require('cors');
-const dns = require('dns').promises;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const DQS_KEY = process.env.SPAMHAUS_DQS_KEY;
 
-// Deterministic hash to calculate a consistent telemetry baseline
-function getHashScore(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) - hash + str.charCodeAt(i);
-    hash |= 0;
+// Set these in Render Environment Variables
+const SPAMHAUS_USER = process.env.SPAMHAUS_USER || 'kerlgtxr@81302263';
+const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
+
+let cachedToken = null;
+let tokenExpiry = 0;
+
+// Fetch auth token from Spamhaus Intelligence API
+async function getAuthToken() {
+  const now = Date.now();
+  if (cachedToken && now < tokenExpiry) {
+    return cachedToken;
   }
-  return (Math.abs(hash) % 85) / 10; // Generates values like 7.8, 4.2, etc.
+
+  const response = await fetch('https://api.spamhaus.org/api/v1/login', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify({
+      username: SPAMHAUS_USER,
+      password: SPAMHAUS_PASS,
+      realm: 'intel'
+    })
+  });
+
+  const rawText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Authentication Failed [${response.status}]: ${rawText}`);
+  }
+
+  const data = JSON.parse(rawText);
+  cachedToken = data.token;
+  
+  // Set token expiration (convert Unix timestamp to ms or default 12 hrs)
+  tokenExpiry = data.expires ? (data.expires * 1000 - 60000) : (now + 12 * 3600 * 1000);
+  
+  return cachedToken;
 }
 
 app.get('/check-domain', async (req, res) => {
@@ -26,49 +56,41 @@ app.get('/check-domain', async (req, res) => {
     return res.status(400).json({ error: 'Domain parameter is required' });
   }
 
-  const sub = { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
-  let totalScore = 0;
-
   try {
-    // Query Spamhaus DQS DNSBL
-    if (DQS_KEY) {
-      try {
-        const queryHost = `${domain}.${DQS_KEY}.dbl.dq.spamhaus.net`;
-        const addresses = await dns.resolve4(queryHost);
+    const token = await getAuthToken();
 
-        addresses.forEach(ip => {
-          if (ip === '127.0.1.2') { sub.smtp = 25; totalScore += 25; }
-          if (ip === '127.0.1.4') { sub.identity = 25; totalScore += 25; }
-          if (ip === '127.0.1.5') { sub.malware = 25; totalScore += 25; }
-          if (ip === '127.0.1.6') { sub.infra = 25; totalScore += 25; }
-          if (ip === '127.0.1.102') { sub.human = 10; totalScore += 10; }
-        });
-      } catch (dnsErr) {
-        // ENOTFOUND / ENODATA -> Not listed on DBL
+    // Query official live domain reputation endpoint
+    const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(domain)}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json'
       }
+    });
+
+    const rawResult = await apiRes.text();
+
+    if (!apiRes.ok) {
+      return res.status(apiRes.status).send(rawResult);
     }
 
-    // Assign dynamic telemetry score if not actively listed
-    if (totalScore === 0) {
-      const infraScore = getHashScore(domain);
-      sub.infra = infraScore;
-      totalScore = infraScore;
-    }
+    const parsed = JSON.parse(rawResult);
+
+    // Extract exact scores
+    const mainScore = parsed.reputation_score ?? parsed.score ?? 0;
+    const subScores = parsed.scores || { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
 
     return res.json({
       domain: domain,
-      reputation_score: totalScore,
-      scores: sub
+      reputation_score: mainScore,
+      scores: subScores,
+      raw: parsed
     });
 
   } catch (error) {
-    return res.status(500).json({
-      error: 'Query failed',
-      details: error.message
-    });
+    return res.status(500).json({ error: 'SIA Request Failed', details: error.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
