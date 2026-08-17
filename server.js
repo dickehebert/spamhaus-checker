@@ -7,7 +7,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Set these in Render Environment Variables
 const SPAMHAUS_USER = process.env.SPAMHAUS_USER || 'kerlgtxr@81302263';
 const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
 
@@ -37,13 +36,11 @@ async function getAuthToken() {
   const rawText = await response.text();
 
   if (!response.ok) {
-    throw new Error(`Authentication Failed [${response.status}]: ${rawText}`);
+    throw new Error(`Login Failed [${response.status}]: ${rawText}`);
   }
 
   const data = JSON.parse(rawText);
   cachedToken = data.token;
-  
-  // Set token expiration (convert Unix timestamp to ms or default 12 hrs)
   tokenExpiry = data.expires ? (data.expires * 1000 - 60000) : (now + 12 * 3600 * 1000);
   
   return cachedToken;
@@ -59,7 +56,7 @@ app.get('/check-domain', async (req, res) => {
   try {
     const token = await getAuthToken();
 
-    // Query official live domain reputation endpoint
+    // Query SIA Endpoint
     const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(domain)}`, {
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -68,29 +65,43 @@ app.get('/check-domain', async (req, res) => {
     });
 
     const rawResult = await apiRes.text();
+    let parsedData;
 
-    if (!apiRes.ok) {
-      return res.status(apiRes.status).send(rawResult);
+    try {
+      parsedData = JSON.parse(rawResult);
+    } catch {
+      // If Spamhaus returns non-JSON, wrap it safely
+      return res.status(apiRes.status).json({
+        error: `Spamhaus returned status ${apiRes.status}`,
+        details: rawResult
+      });
     }
 
-    const parsed = JSON.parse(rawResult);
+    if (!apiRes.ok) {
+      return res.status(apiRes.status).json({
+        error: parsedData.message || 'API query failed',
+        details: parsedData
+      });
+    }
 
-    // Extract exact scores
-    const mainScore = parsed.reputation_score ?? parsed.score ?? 0;
-    const subScores = parsed.scores || { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
+    // Extract numerical scores
+    const mainScore = parsedData.reputation_score ?? parsedData.score ?? 0;
+    const subScores = parsedData.scores || { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
 
     return res.json({
       domain: domain,
       reputation_score: mainScore,
-      scores: subScores,
-      raw: parsed
+      scores: subScores
     });
 
   } catch (error) {
-    return res.status(500).json({ error: 'SIA Request Failed', details: error.message });
+    return res.status(500).json({
+      error: 'SIA Proxy Failed',
+      details: error.message
+    });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
