@@ -9,31 +9,6 @@ const PORT = process.env.PORT || 3000;
 const SPAMHAUS_USER = process.env.SPAMHAUS_USER;
 const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
 
-// Official Spamhaus Intelligence API login function
-async function getAuthToken() {
-  const response = await fetch('https://api.spamhaus.org/api/v1/login', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: JSON.stringify({
-      username: SPAMHAUS_USER,
-      password: SPAMHAUS_PASS,
-      realm: 'intel'
-    })
-  });
-
-  const rawText = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`Token Login Failed [${response.status}]: ${rawText}`);
-  }
-
-  const data = JSON.parse(rawText);
-  return data.token; // Returns the SIA Bearer token
-}
-
 app.get('/check-domain', async (req, res) => {
   const { domain } = req.query;
 
@@ -42,27 +17,61 @@ app.get('/check-domain', async (req, res) => {
   }
 
   try {
-    const token = await getAuthToken();
+    // 1. First Attempt: Query check.spamhaus.org using Basic Auth
+    const basicAuth = Buffer.from(`${SPAMHAUS_USER}:${SPAMHAUS_PASS}`).toString('base64');
     
-    // Official Spamhaus Intelligence Domain Lookup Endpoint
-    const apiRes = await fetch(`https://api.spamhaus.org/api/intel/v1/byobject/domain/live/${encodeURIComponent(domain)}`, {
+    let apiRes = await fetch(`https://check.spamhaus.org/api/checker/v1/domain/${encodeURIComponent(domain)}`, {
       headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
+        'Authorization': `Basic ${basicAuth}`,
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
       }
     });
 
-    const resultText = await apiRes.text();
-    
+    let rawText = await apiRes.text();
+
+    // 2. Second Attempt: If Basic Auth is rejected, try Token Auth via submit.spamhaus.org
+    if (apiRes.status === 401 || apiRes.status === 404) {
+      const authRes = await fetch('https://submit.spamhaus.org/api/v1/authenticate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: SPAMHAUS_USER, password: SPAMHAUS_PASS })
+      });
+
+      const authText = await authRes.text();
+
+      if (!authRes.ok) {
+        return res.status(authRes.status).json({
+          error: "Spamhaus Authentication Failed",
+          details: authText
+        });
+      }
+
+      const authData = JSON.parse(authText);
+      const token = authData.token || authData.access_token;
+
+      // Query checker with the generated Bearer Token
+      apiRes = await fetch(`https://check.spamhaus.org/api/checker/v1/domain/${encodeURIComponent(domain)}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0'
+        }
+      });
+
+      rawText = await apiRes.text();
+    }
+
+    // Return response JSON or raw output
     try {
-      const jsonResult = JSON.parse(resultText);
+      const jsonResult = JSON.parse(rawText);
       return res.json(jsonResult);
     } catch {
-      return res.status(apiRes.status).send(resultText);
+      return res.status(apiRes.status).send(rawText);
     }
 
   } catch (error) {
-    return res.status(500).json({ error: 'Spamhaus API Error', details: error.message });
+    return res.status(500).json({ error: 'Proxy Request Failed', details: error.message });
   }
 });
 
