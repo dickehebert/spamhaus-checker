@@ -11,7 +11,7 @@ const SPAMHAUS_PASS = process.env.SPAMHAUS_PASS;
 
 async function getAuthToken() {
   const credentials = Buffer.from(`${SPAMHAUS_USER}:${SPAMHAUS_PASS}`).toString('base64');
-
+  
   const response = await fetch('https://api.spamhaus.org/v1/token', {
     method: 'POST',
     headers: {
@@ -22,7 +22,13 @@ async function getAuthToken() {
     body: 'grant_type=client_credentials'
   });
 
-  const data = await response.json();
+  const rawText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Token request failed [${response.status}]: ${rawText}`);
+  }
+
+  const data = JSON.parse(rawText);
   return data.access_token;
 }
 
@@ -35,7 +41,7 @@ app.get('/check-domain', async (req, res) => {
 
   try {
     const token = await getAuthToken();
-
+    
     const apiRes = await fetch(`https://check.spamhaus.org/api/checker/v1/domain/${encodeURIComponent(domain)}`, {
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -44,10 +50,17 @@ app.get('/check-domain', async (req, res) => {
       }
     });
 
-    const result = await apiRes.json();
-    return res.json(result);
+    const resultText = await apiRes.text();
+    
+    try {
+      const jsonResult = JSON.parse(resultText);
+      return res.json(jsonResult);
+    } catch {
+      return res.status(apiRes.status).send(resultText);
+    }
+
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to fetch domain data', details: error.message });
+    return res.status(500).json({ error: 'Spamhaus API Error', details: error.message });
   }
 });
 
