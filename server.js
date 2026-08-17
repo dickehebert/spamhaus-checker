@@ -7,39 +7,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Cache session token in memory to avoid requesting a new one every query
-let cachedToken = null;
-let tokenExpiry = 0;
-
-async function getSpamhausToken() {
-  const now = Date.now();
-  if (cachedToken && now < tokenExpiry) {
-    return cachedToken;
-  }
-
-  // Obtain live query token from Spamhaus checker session
-  const res = await fetch('https://check.spamhaus.org/api/checker/v1/token', {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Referer': 'https://check.spamhaus.org/'
-    }
-  });
-
-  if (!res.ok) {
-    throw new Error(`Token Generation Failed [${res.status}]`);
-  }
-
-  const data = await res.json();
-  cachedToken = data.token || data.access_token;
-  // Expire local cache after 30 minutes
-  tokenExpiry = now + 30 * 60 * 1000;
-
-  return cachedToken;
-}
-
 app.get('/check-domain', async (req, res) => {
   const { domain } = req.query;
 
@@ -48,37 +15,39 @@ app.get('/check-domain', async (req, res) => {
   }
 
   try {
-    const token = await getSpamhausToken();
-
-    // Direct fetch using the active session token
-    const apiRes = await fetch(`https://check.spamhaus.org/api/checker/v1/domain/${encodeURIComponent(domain)}`, {
+    // Direct call to the main www.spamhaus.org reputation endpoint
+    const response = await fetch(`https://www.spamhaus.org/api/v1/reputation/domain/${encodeURIComponent(domain)}`, {
       headers: {
-        'Authorization': `Bearer ${token}`,
         'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.spamhaus.org/domain-reputation'
       }
     });
 
-    const rawText = await apiRes.text();
+    const rawText = await response.text();
 
     try {
       const data = JSON.parse(rawText);
 
-      // Extract exact reputation score & sub-scores
-      const mainScore = data.reputation_score ?? data.score ?? data.reputation?.score ?? 0;
-      const sub = data.scores || data.reputation?.scores || { human: 0, identity: 0, infra: 0, malware: 0, smtp: 0 };
-
+      // Return the exact score values
       return res.json({
         domain: domain,
-        reputation_score: mainScore,
-        scores: sub
+        reputation_score: data.reputation_score ?? data.score ?? 0,
+        scores: {
+          human: data.scores?.human ?? 0,
+          identity: data.scores?.identity ?? 0,
+          infra: data.scores?.infra ?? 0,
+          malware: data.scores?.malware ?? 0,
+          smtp: data.scores?.smtp ?? 0
+        }
       });
     } catch {
-      return res.status(apiRes.status).send(rawText);
+      // If Spamhaus changes structural format, output raw JSON response
+      return res.status(response.status).send(rawText);
     }
 
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to query domain score', details: error.message });
+    return res.status(500).json({ error: 'Failed to fetch score', details: error.message });
   }
 });
 
